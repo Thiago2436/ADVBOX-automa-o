@@ -1,0 +1,1387 @@
+Visão Geral da Solução
+ O objetivo é automatizar um fluxo “e-mail → tarefa” para que, quando um cliente envie um pedido contratual à caixa compartilhada do Outlook 365, o sistema:
+Capte o e-mail via Power Automate (Fluxo na Nuvem).
+
+
+Verifique se o remetente/cliente está autorizado (ativo, inativo ou não cadastrado) consultando a API de consulta de clientes do ADVBox (ou uma lista interna).
+
+
+Envie o conteúdo do e-mail a um LLM (Azure OpenAI) que:
+
+
+Classifique o tipo de solicitação (novo contrato, renovação, alteração, rescisão, etc.).
+
+
+Extraia dados estruturados (nome do cliente, número do contrato, valor, prazo, advogado responsável, etc.).
+
+
+Gere um resumo sucinto em português.
+
+
+Crie a tarefa no ADVBox usando RPA (Browser-Use) para preencher o formulário web, pois não há endpoint POST disponível.
+
+
+Envie e-mail de confirmação ao cliente e copie ao advogado responsável, informando o número da tarefa e o resumo.
+
+
+Como o ADVBox não possui endpoints para criar tarefas, a automação de “criar tarefa” será implementada com Power Automate Desktop (ou Power Automate UI Flow) para simular a navegação e o preenchimento na interface web. Todo o restante roda em Azure (Power Automate Cloud, Azure Functions, Azure OpenAI e Azure Key Vault) e no Power Automate Desktop como RPA.
+
+1. Pré-requisitos
+Azure Subscription (com recurso para:
+
+
+Azure Functions (para hospedar nossas funções “ValidaCliente” e “ProcessaEmail”).
+
+
+Azure OpenAI (para usar o LLM).
+
+
+Azure Key Vault (para guardar segredos: chaves do OpenAI, credenciais de login no ADVBox, token de consulta de clientes).
+
+
+Azure Storage Account (opcional, caso queiramos guardar anexos do e-mail temporariamente).
+
+
+Power Automate Cloud (licença que permita:
+
+
+Conectores Office 365 Outlook (para ler e-mails da caixa compartilhada).
+
+
+Conector “Executar fluxo de Desktop” para disparar o RPA.
+
+
+Power Automate Desktop (para criar o RPA que preenche o ADVBox).
+
+
+Caixa de E-mail Compartilhada no Outlook 365 (ex.: suporte@seudominio.com), com permissão de “Ler todas as mensagens” para o conector do Power Automate.
+
+
+Credenciais de um usuário ADVBox (com permissão de criar tarefas pela interface web). Se possível, crie um usuário específico para automação (evitando 2FA).
+
+
+Token de Acesso (Bearer) para consultar dados de cliente via API GET do ADVBox (caso você vá validar “ativo/inativo” desse modo).
+
+
+Volume estimado: até 30 chamados/dia, anexos de até 10 MB cada.
+
+
+Equipes:
+
+
+Interna de TI (para aprovar as configurações e testes).
+
+
+Interna de Suporte Jurídico (para receber e-mails de confirmação e acompanhar tickets).
+
+
+
+2. Arquitetura de Alto Nível
++------------------+      ① e-mail chega      +------------------------+
+| Cliente / Advogado| --------------------->  | Caixa Compartilhada    |
++------------------+                          |   Outlook 365          |
+                                              +------------------------+
+                                                     │
+                                                     │ (Power Automate Cloud “Quando um e-mail chega”)
+                                                     ▼
+                     +---------------------------------------------------+
+                     |           Power Automate (Fluxo na Nuvem)         |
+                     |                                                   |
+                     | 1. (Opcional) Verifica domínio do remetente       |
+                     | 2. Chama Azure Function “ValidaCliente” (HTTP)    |
+                     |    → retorna status: “ativo”, “inativo” ou “não encontrado” |
+                     | 3. Se “inativo” ou “não encontrado” → envia e-mail de aviso e encerra |
+                     |    Se “ativo” → seguiu              			  |
+                     | 4. (Opcional) Obter anexos do e-mail, enviar ao  |
+                     |    Blob Storage e montar array de URLs SAS        |
+                     | 5. Chama Azure Function “ProcessaEmail” (HTTP)    |
+                     |    → LLM (Azure OpenAI) retorna JSON com:         |
+                     |      • cliente                                       |
+                     |      • tipoSolicitacao                               |
+                     |      • dadosExtraidos (numeroContrato, valor, prazo, advogadoResponsavel) |
+                     |      • summary                                      |
+                     |      • anexosParaRPA (lista de {filename, blobUrl})|
+                     | 6. Se JSON OK e statusCliente == “ativo” → chama   |
+                     |    RPA (Power Automate Desktop) para criar tarefa  |
+                     |    no ADVBox (recebendo variáveis: cliente, tipo,..., anexos) |
+                     |    e retorna “idAdvBox”                            |
+                     | 7. Envia e-mail de confirmação ao cliente + advogado|
+                     +---------------------------------------------------+
+
+Azure Function “ValidaCliente” (HTTP Trigger)
+ – Recebe nome ou e-mail do cliente e faz GET na API ADVBox (/clientes?filter=name eq '<cliente>') usando token.
+ – Retorna { "status": "ativo" }, { "status": "inativo" } ou { "status": "nao_encontrado" }.
+
+
+Azure Function “ProcessaEmail” (HTTP Trigger)
+ – Recebe JSON com remetente, assunto, corpo, URLs SAS dos anexos.
+ – Monta prompt para LLM (Azure OpenAI), pedindo:
+
+
+Classificar tipo de solicitação (ex.: “novo_contrato”, “renovacao_contrato”, “alteracao_contrato”, “rescisao_contrato”, “outro”).
+
+
+Extrair campos: cliente, numeroContrato, valor, prazo, advogadoResponsavel.
+
+
+Gerar resumo em até 3 frases.
+ – Chama Azure OpenAI (GPT-3.5-turbo ou GPT-4) e recebe resposta apenas em JSON.
+ – Constrói retorno final, incluindo a lista anexosParaRPA (cada item: { "filename": "...", "blobUrl": "https://...SAS..." }).
+
+
+Power Automate Desktop (RPA)
+ – Executa em uma máquina Windows (ou VM Windows) que esteja sempre ligada.
+ – Parâmetros de entrada do fluxo:
+ • cliente (string)
+ • tipoSolicitacao (string)
+ • numeroContrato (string)
+ • valor (string)
+ • prazo (string)
+ • advogadoResponsavel (string)
+ • summary (string)
+ • anexosParaRPA (list com { filename, blobUrl }).
+ – Passos no RPA:
+
+
+Abrir navegador (Chrome/Edge) em https://app.advbox.com/login.
+
+
+Fazer login com credenciais armazenadas no PAD (“Gerenciar Credenciais”).
+
+
+Navegar até “Nova Tarefa”.
+
+
+Preencher campos: título, descrição, cliente, número do contrato, valor, prazo, advogado.
+
+
+Para cada item em anexosParaRPA:
+ a. Abrir blobUrl para baixar o anexo em %Downloads%.
+ b. Aguardar download completo.
+ c. No formulário ADVBox, clicar em “Anexar arquivo” e apontar para %Downloads%\{filename}.
+ d. (Opcional) Excluir o arquivo local.
+
+
+Clicar em “Salvar”.
+
+
+Extrair número da tarefa (ex.: Regex em “Tarefa #1234 criada com sucesso”).
+
+
+Retornar para o Power Automate Cloud: { "idAdvBox": "1234" }.
+
+
+Power Automate Cloud
+ – Recebe “idAdvBox” do RPA e envia e-mail de confirmação para:
+
+
+“Para”: remetente original (cliente).
+
+
+“CC”: advogadoResponsavel (e-mail retornado pelo LLM).
+ – Assunto: Confirmação de Tarefa ADVBox – #@{idAdvBox}
+ – Corpo (exemplo):
+
+ Olá @{body('ResultadoEmail')?['cliente']},
+
+Sua solicitação foi processada com sucesso!
+→ Número da Tarefa ADVBox: @{body('saidaRPA')?['idAdvBox']}
+→ Resumo: @{body('ResultadoEmail')?['summary']}
+
+Advogado responsável (@{body('ResultadoEmail')?['dadosExtraidos/advogadoResponsavel']}) já foi copiado.
+
+Atenciosamente,
+Equipe de Automação
+
+
+
+3. Detalhamento de Cada Componente
+3.1. Azure Key Vault
+Segredos a criar:
+
+
+OPENAI_API_KEY → chave do Azure OpenAI (obtida no portal Azure_OpenAI → Keys & Endpoint).
+
+
+ADVBOX_USER → usuário de login no ADVBox (para o RPA).
+
+
+ADVBOX_PASS → senha do usuário RPA no ADVBox.
+
+
+ADVBOX_API_TOKEN → token OAuth2/Bearer para consultar dados de clientes (API GET).
+
+
+(Opcional) BLOB_CONNECTION_STRING → connection string do Storage Account, caso a Azure Function gere URLs SAS.
+
+
+Permissões:
+
+
+Conceder à Managed Identity do Function App permissão “Get” para esses segredos.
+
+
+(Opcional) Conceder à Managed Identity do Function App ou a um Service Principal permissão de geração de SAS no Storage.
+
+
+
+3.2. Azure Function “ValidaCliente” (opcional, mas recomendado)
+Escopo: verificar se o “cliente” extraído do e-mail existe e está ativo no sistema ADVBox.
+# Arquivo: valida_cliente_function.py
+import os
+import json
+import logging
+import azure.functions as func
+import requests
+from azure.identity import DefaultAzureCredential
+from azure.keyvault.secrets import SecretClient
+
+KEYVAULT_NAME = os.getenv("KEYVAULT_NAME")  # ex.: "eluminai-kv"
+KV_URI = f"https://{KEYVAULT_NAME}.vault.azure.net"
+ADVBOX_API_BASE = "https://api.softwareadvbox.com.br/v1"  # Base da API
+
+def main(req: func.HttpRequest) -> func.HttpResponse:
+    logging.info("Iniciando ValidaCliente")
+
+    try:
+        body = req.get_json()
+        cliente = body.get("cliente", "").strip()
+        if not cliente:
+            return func.HttpResponse("campo 'cliente' é obrigatório.", status_code=400)
+    except:
+        return func.HttpResponse("JSON inválido.", status_code=400)
+
+    # Obter token do Key Vault
+    credential = DefaultAzureCredential()
+    secret_client = SecretClient(vault_url=KV_URI, credential=credential)
+    advbox_token = secret_client.get_secret("ADVBOX_API_TOKEN").value
+
+    # Fazer GET na API ADVBox
+    url = f"{ADVBOX_API_BASE}/clientes?filter=name eq '{cliente}'"
+    headers = {
+        "Authorization": f"Bearer {advbox_token}",
+        "Content-Type": "application/json"
+    }
+    resp = requests.get(url, headers=headers, timeout=10)
+    if resp.status_code != 200:
+        logging.error(f"Erro ao consultar ADVBox: {resp.status_code} – {resp.text}")
+        return func.HttpResponse("Erro no serviço ADVBox.", status_code=500)
+
+    dados = resp.json()
+    if not dados.get("value"):
+        status = "nao_encontrado"
+    else:
+        info = dados["value"][0]
+        sts = info.get("status", "").lower()  # supondo “Ativo” ou “Inativo”
+        status = "ativo" if sts == "ativo" else "inativo"
+
+    resultado = { "status": status }
+    return func.HttpResponse(json.dumps(resultado), status_code=200, mimetype="application/json")
+
+Deploy
+No Azure Portal, crie um Function App (plano Consumption, Runtime Python 3.9+).
+
+
+Habilite a Managed Identity do Function App e, no Key Vault, dê permissão de leitura (“Get”) para ela.
+
+
+Defina em Application Settings:
+
+
+KEYVAULT_NAME = nome do seu Key Vault (ex.: eluminai-kv).
+
+
+ADVBOX_API_BASE (se for variável; caso contrário, deixar hardcoded).
+
+
+Publique o código pelo VS Code (Azure Functions Extension) ou via CI/CD.
+
+
+
+3.3. Azure Function “ProcessaEmail”
+# Arquivo: processa_email_function.py
+import os
+import json
+import logging
+import azure.functions as func
+from azure.identity import DefaultAzureCredential
+from azure.keyvault.secrets import SecretClient
+from azure.ai.openai import OpenAIClient, AzureKeyCredential
+# Se quiser baixar anexos e converter em base64, importe azure.storage.blob, base64, etc.
+
+# Settings (definidos em Application Settings do Function App)
+KEYVAULT_NAME = os.getenv("KEYVAULT_NAME")            # ex.: "eluminai-kv"
+KV_URI = f"https://{KEYVAULT_NAME}.vault.azure.net"
+OPENAI_ENDPOINT = os.getenv("OPENAI_ENDPOINT")        # ex.: "https://eluminai-openai.openai.azure.com/"
+OPENAI_DEPLOYMENT = os.getenv("OPENAI_DEPLOYMENT")    # ex.: "gpt-35-turbo"
+# (Opcional) STORAGE_ACCOUNT_NAME, STORAGE_ACCOUNT_CONTAINER se for usar Blob SAS
+
+def main(req: func.HttpRequest) -> func.HttpResponse:
+    logging.info("ProcessaEmail: recebendo requisição")
+
+    try:
+        body = req.get_json()
+    except:
+        return func.HttpResponse("JSON inválido.", status_code=400)
+
+    remetente = body.get("from", "")
+    assunto = body.get("subject", "")
+    texto_email = body.get("body", "")
+    anexos = body.get("attachments", [])  # cada item: { "filename": "...", "blobUrl": "..." }
+
+    # 1) Montar prompt para o LLM
+    prompt = montar_prompt(remetente, assunto, texto_email, anexos)
+
+    # 2) Autenticar no Key Vault para obter OPENAI_API_KEY
+    credential = DefaultAzureCredential()
+    secret_client = SecretClient(vault_url=KV_URI, credential=credential)
+    openai_key = secret_client.get_secret("OPENAI_API_KEY").value
+
+    # 3) Chamar Azure OpenAI
+    logging.info("Chamando Azure OpenAI para extrair e classificar dados...")
+    client = OpenAIClient(OPENAI_ENDPOINT, AzureKeyCredential(openai_key))
+    response = client.get_chat_completions(
+        deployment_id=OPENAI_DEPLOYMENT,
+        messages=[
+            {"role": "system", "content": "Você é um assistente que extrai dados contratuais de e-mails e gera um resumo em português."},
+            {"role": "user", "content": prompt}
+        ],
+        max_tokens=600,
+        temperature=0.0
+    )
+
+    conteudo = response.choices[0].message.content
+    logging.info(f"Resposta LLM: {conteudo}")
+
+    # 4) Tentar parsear JSON
+    try:
+        resultado = json.loads(conteudo)
+    except json.JSONDecodeError as e:
+        logging.error(f"Falha ao decodificar JSON do LLM: {e}")
+        return func.HttpResponse(status_code=500, body="Resposta do LLM não retornou JSON válido.")
+
+    # 5) Construir lista de anexos para RPA (mantendo apenas filename e blobUrl)
+    anexos_para_rpa = []
+    for a in anexos:
+        filename = a.get("filename")
+        blobUrl = a.get("blobUrl")
+        anexos_para_rpa.append({ "filename": filename, "blobUrl": blobUrl })
+
+    # 6) Montar JSON de resposta
+    saida = {
+        "cliente": resultado.get("cliente"),
+        "tipoSolicitacao": resultado.get("tipoSolicitacao"),
+        "dadosExtraidos": {
+            "numeroContrato": resultado.get("numeroContrato"),
+            "valor": resultado.get("valor"),
+            "prazo": resultado.get("prazo"),
+            "advogadoResponsavel": resultado.get("advogadoResponsavel")
+        },
+        "summary": resultado.get("summary"),
+        "anexosParaRPA": anexos_para_rpa
+    }
+
+    return func.HttpResponse(
+        status_code=200,
+        body=json.dumps(saida, ensure_ascii=False),
+        mimetype="application/json"
+    )
+
+def montar_prompt(remetente: str, assunto: str, texto_email: str, anexos: list) -> str:
+    """
+    Monta o prompt que enviaremos ao LLM. Solicitamos:
+     1) Classificar o tipo de solicitação.
+     2) Extrair cliente, numeroContrato, valor, prazo, advogadoResponsavel.
+     3) Gerar resumo em até 2–3 frases.
+     4) Retornar apenas JSON válido conforme schema.
+    """
+    lista_anexos = ", ".join([a.get("filename") for a in anexos]) if anexos else "nenhum"
+    texto = f"""
+    Você é um assistente que recebe estes dados de um e-mail:
+    - Remetente: {remetente}
+    - Assunto: {assunto}
+    - Corpo do e-mail: \"\"\"{texto_email}\"\"\"
+    - Anexos: {lista_anexos}
+
+    Por favor:
+    1) Classifique a solicitação em um destes valores (campo "tipoSolicitacao"):
+       - "novo_contrato"
+       - "renovacao_contrato"
+       - "alteracao_contrato"
+       - "rescisao_contrato"
+       - "outro"
+
+    2) Extraia estes campos obrigatórios (campos no JSON):
+       - "cliente": nome exato da empresa ou pessoa
+       - "numeroContrato": se mencionado (só números)
+       - "valor": se mencionado (apenas números e separadores)
+       - "prazo": se mencionado (ex.: "12 meses", "30 dias")
+       - "advogadoResponsavel": e-mail ou nome do advogado, se houver
+
+    3) Gere um resumo (campo "summary") em português, no máximo 2 ou 3 frases.
+
+    4) Retorne **apenas** um objeto JSON com esta estrutura:
+    {{
+      "cliente": "...",
+      "numeroContrato": "...",
+      "valor": "...",
+      "prazo": "...",
+      "tipoSolicitacao": "...",
+      "advogadoResponsavel": "...",
+      "summary": "..."
+    }}
+    """
+    return texto.strip()
+
+Deploy
+No portal Azure, crie (ou reutilize) o mesmo Function App do “ValidaCliente”.
+
+
+Defina as Application Settings:
+
+
+KEYVAULT_NAME → nome do seu Key Vault (ex.: eluminai-kv).
+
+
+OPENAI_ENDPOINT → endpoint do seu Azure OpenAI (ex.: https://eluminai-openai.openai.azure.com/).
+
+
+OPENAI_DEPLOYMENT → nome do deployment (ex.: gpt-35-turbo).
+
+
+Habilite a Managed Identity do Function App (se ainda não fez).
+
+
+No Key Vault, cuide de conceder permissão “Get” para essa identidade acessar OPENAI_API_KEY.
+
+
+Publique o código (VS Code + Azure Functions Extension ou CI/CD).
+
+
+Teste usando “Test in portal” ou Postman, enviando JSON de exemplo:
+
+ {
+  "from": "cliente@exemplo.com.br",
+  "subject": "Renovação de contrato",
+  "body": "Olá, gostaria de renovar o contrato número 7890 no valor de R$ 25.000,00 por 6 meses. Advogado: ricardo@advocacia.com. Anexo proposta.pdf.",
+  "attachments": [
+    {
+      "filename": "proposta.pdf",
+      "blobUrl": "https://<conta>.blob.core.windows.net/tempanexos/proposta.pdf?<SASToken>"
+    }
+  ]
+}
+
+
+Aguarde retorno algo tipo:
+
+ {
+  "cliente": "Empresa Exemplo",
+  "tipoSolicitacao": "renovacao_contrato",
+  "dadosExtraidos": {
+    "numeroContrato": "7890",
+    "valor": "25000",
+    "prazo": "6 meses",
+    "advogadoResponsavel": "ricardo@advocacia.com"
+  },
+  "summary": "Empresa Exemplo solicita renovação do contrato 7890 no valor de R$ 25.000,00 por 6 meses. Anexo: proposta.pdf.",
+  "anexosParaRPA": [
+    { "filename": "proposta.pdf", "blobUrl": "https://<conta>.blob.core.windows.net/tempanexos/proposta.pdf?<SASToken>" }
+  ]
+}
+
+
+
+3.4. Power Automate Cloud – Fluxo Completo
+1) Gatilho
+Conector: Office 365 Outlook → “Quando um novo e-mail chega (V3)”.
+
+
+Configurações:
+
+
+Caixa: caixa compartilhada (ex.: suporte@seudominio.com).
+
+
+Pasta: /Inbox/SolicitacoesContratuais.
+
+
+Aplica filtro de anexos (opcional) ou de assunto.
+
+
+2) (Opcional) Verificar domínio do remetente
+Insira uma ação “Condição” com expressão:
+
+ @contains(triggerOutputs()?['body/from'], '@cliente.com.br')
+
+
+Se Falso:
+
+
+Enviar e-mail (Office 365 Outlook – “Enviar um e-mail (V2)”) para o remetente:
+
+
+Assunto: “Remetente não autorizado”
+
+
+Corpo: “Desculpe, seu e-mail não pertence à uma conta de cliente cadastrada.”
+
+
+Terminar fluxo.
+
+
+Se Verdadeiro: continuar.
+
+
+3) Chamar Azure Function ValidaCliente (HTTP)
+Ação: HTTP
+
+
+Método: POST
+
+
+URL:
+
+ https://<seu-func-app>.azurewebsites.net/api/ValidaCliente?code=<sua-chave-de-func>
+
+
+Cabeçalhos: { "Content-Type": "application/json" }
+
+
+Corpo:
+
+ { "cliente": "@{triggerOutputs()?['body/from']}" }
+
+
+Armazene a resposta em uma variável chamada statusClienteResponse.
+
+
+4) Condição de statusCliente
+Avalie:
+
+ @equals(body('ValidaCliente')?['status'], 'inativo')
+
+
+Se “inativo”:
+
+
+Enviar e-mail para o remetente:
+
+
+Assunto: “Cliente inativo”
+
+
+Corpo: “Seu cadastro está inativo. Entre em contato com o suporte.”
+
+
+Terminar fluxo.
+
+
+Outro ramo:
+
+ @equals(body('ValidaCliente')?['status'], 'nao_encontrado')
+
+
+Se “nao_encontrado”:
+
+
+Enviar e-mail “Cliente não cadastrado.”
+
+
+Terminar fluxo.
+
+
+Caso contrário (status == "ativo"), prossiga.
+
+
+5) (Opcional) Obter e salvar Anexos
+Se desejar que a Function receba apenas URLs em vez de base64 grande, faça:
+Condição:
+
+ @greater(length(triggerOutputs()?['body/HasAttachments']), 0)
+
+
+Se houver anexos:
+
+
+“Obter anexos” (Get attachments) → retorna lista com metadados (Attachments).
+
+
+Para cada anexo em Attachments:
+
+
+“Obter conteúdo do anexo” → retorna contentBytes base64.
+
+
+“Criar blob” (Azure Blob Storage)
+
+
+Conta: sua Storage Account.
+
+
+Container: tempanexos.
+
+
+Blob name: @{items('Aplicar_para_cada')?['Name']}
+
+
+Blob content: @{body('Get_attachment')?['contentBytes']}
+
+
+Gere URL SAS para esse blob (no próprio conector, escolha “Conceder acesso (SAS)” por 2 horas).
+
+
+Monte um registro JSON:
+
+ {
+  "filename": "@{items('Aplicar_para_cada')?['Name']}",
+  "blobUrl": "@{body('Criar_blob')?['BlobUriWithSas']}"
+}
+
+
+Armazene esse registro em uma variável de array anexosParaEnvio.
+
+
+Se não houver anexos: defina anexosParaEnvio como [].
+
+
+6) Chamar Azure Function ProcessaEmail
+Ação: HTTP
+
+
+Método: POST
+
+
+URL:
+
+ https://<seu-func-app>.azurewebsites.net/api/ProcessaEmail?code=<sua-chave-de-func>
+
+
+Cabeçalhos: { "Content-Type": "application/json" }
+
+
+Corpo:
+
+ {
+  "from": "@{triggerOutputs()?['body/from']}",
+  "subject": "@{triggerOutputs()?['body/subject']}",
+  "body": "@{triggerOutputs()?['body/bodyPreview']}",
+  "attachments": @{variables('anexosParaEnvio')}
+}
+
+
+Armazene a resposta JSON em ResultadoEmail.
+
+
+7) Validar saída de ProcessaEmail
+Condição (para checar se ResultadoEmail.cliente existe):
+
+ @equals(body('ProcessaEmail')?['cliente'], null)
+
+
+Se verdadeiro:
+
+
+Enviar e-mail para TI: “Falha ao processar e-mail. JSON do LLM inválido.”
+
+
+Terminar.
+
+
+Se falso: continuar.
+
+
+8) Executar RPA (Power Automate Desktop)
+Ação: “Run a flow built with Power Automate Desktop”
+
+
+Selecione: ambiente e fluxo RPA_CriarTarefa_ADVBox.
+
+
+Parâmetros de entrada:
+
+
+Nome (PAD)
+Valor
+cliente
+@{body('ProcessaEmail')?['cliente']}
+tipoSolicitacao
+@{body('ProcessaEmail')?['tipoSolicitacao']}
+numeroContrato
+@{body('ProcessaEmail')?['dadosExtraidos/numeroContrato']}
+valor
+@{body('ProcessaEmail')?['dadosExtraidos/valor']}
+prazo
+@{body('ProcessaEmail')?['dadosExtraidos/prazo']}
+advogadoResponsavel
+@{body('ProcessaEmail')?['dadosExtraidos/advogadoResponsavel']}
+summary
+@{body('ProcessaEmail')?['summary']}
+anexosParaRPA
+@{body('ProcessaEmail')?['anexosParaRPA']}
+
+
+Armazenar saída em variável saidaRPA (que receberá { "idAdvBox": "1234" }).
+
+
+9) Enviar e-mail de confirmação
+Ação: Office 365 Outlook → “Enviar um e-mail (V2)”
+
+
+Para: @{triggerOutputs()?['body/from']}
+
+
+CC: @{body('ProcessaEmail')?['dadosExtraidos/advogadoResponsavel']}
+
+
+Assunto:
+
+ Confirmação de Tarefa ADVBox – #@{body('saidaRPA')?['idAdvBox']}
+
+
+Corpo (texto simples ou HTML):
+
+ Olá @{body('ProcessaEmail')?['cliente']},
+
+Sua solicitação foi processada com sucesso!
+
+→ Número da Tarefa ADVBox: @{body('saidaRPA')?['idAdvBox']}
+→ Resumo: @{body('ProcessaEmail')?['summary']}
+
+Advogado responsável ( @{body('ProcessaEmail')?['dadosExtraidos/advogadoResponsavel']} ) já foi copiado.
+
+Atenciosamente,
+Equipe de Automação
+
+
+10) Fim
+O fluxo encerra com sucesso.
+
+
+
+4. Power Automate Desktop (RPA) – Passo a Passo
+4.1. Criar o Flow no PAD
+Abra o Power Automate Desktop e crie um novo fluxo chamado RPA_CriarTarefa_ADVBox.
+
+
+Configurar Variáveis de Entrada:
+
+
+Na guia “Variáveis”, clique em “Adicionar variável” e selecione “Entrada de fluxo” para cada um:
+
+
+cliente (Tipo: Texto)
+
+
+tipoSolicitacao (Texto)
+
+
+numeroContrato (Texto)
+
+
+valor (Texto)
+
+
+prazo (Texto)
+
+
+advogadoResponsavel (Texto)
+
+
+summary (Texto)
+
+
+anexosParaRPA (Tipo: Lista de Registros)
+
+
+Armazenar Credenciais ADVBox:
+
+
+No PAD, vá em “Gerenciar Credenciais” e crie uma credencial chamada Credencial_ADVBox com usuário (ADVBOX_USER) e senha (ADVBOX_PASS).
+
+
+4.2. Sequência de Ações
+Abrir Navegador
+
+
+Ação: “Launch new Chrome” (ou “Microsoft Edge”)
+
+
+URL: https://app.advbox.com/login
+
+
+Aguarde 5 segundos para carregar.
+
+
+Fazer Login
+
+
+Ação: “Fill Text Field on Web Page”
+
+
+Seletor: campo “E-mail” do ADVBox (use inspecionar elemento para obter CSS/XPath).
+
+
+Texto: %Credencial_ADVBox.Username%
+
+
+Ação: “Fill Secure Text Field on Web Page”
+
+
+Seletor: campo “Senha”
+
+
+Texto: %Credencial_ADVBox.Password%
+
+
+Ação: “Click Element on Web Page”
+
+
+Seletor: botão “Entrar”
+
+
+Ação: “Wait” → 5 segundos (ou “Wait for Web Page Content” até que o menu principal apareça).
+
+
+Navegar até “Nova Tarefa”
+
+
+Ação: “Click Element on Web Page”
+
+
+Seletor: ícone/menu lateral para “Tarefas”.
+
+
+Ação: “Click Element on Web Page”
+
+
+Seletor: botão “Nova Tarefa”.
+
+
+Ação: “Wait” → 5 segundos (até o formulário carregar).
+
+
+Preencher Campos do Formulário
+
+
+Título:
+
+
+Ação: “Fill Text Field on Web Page”
+
+
+Seletor: campo “Título”
+
+
+Texto: Solicitação %{tipoSolicitacao}% - %{cliente}%
+
+
+Descrição:
+
+
+Ação: “Fill Text Area on Web Page”
+
+
+Seletor: campo “Descrição” (área de texto rica)
+
+
+Texto: %summary%
+
+
+Cliente (lista dropdown ou campo):
+
+
+Ação: “Select Item in List” ou “Fill Text Field”
+
+
+Seletor: dropdown/elemento “Cliente”
+
+
+Texto: %cliente%
+
+
+Número do Contrato:
+
+
+Ação: “Fill Text Field on Web Page”
+
+
+Seletor: campo “Número do Contrato”
+
+
+Texto: %numeroContrato%
+
+
+Valor:
+
+
+Ação: “Fill Text Field on Web Page”
+
+
+Seletor: campo “Valor”
+
+
+Texto: %valor%
+
+
+Prazo:
+
+
+Ação: “Fill Text Field on Web Page”
+
+
+Seletor: campo “Prazo”
+
+
+Texto: %prazo%
+
+
+Advogado Responsável:
+
+
+Ação: “Fill Text Field on Web Page” (ou “Select Item in List”)
+
+
+Seletor: campo “Advogado”
+
+
+Texto: %advogadoResponsavel%
+
+
+Anexar Documentos (se houver)
+
+
+Ação: “If”
+
+
+Condição: Length(anexosParaRPA) > 0
+
+
+Then (para cada anexo em anexosParaRPA):
+
+
+Ação: “Launch new Chrome” (ou reusar aba atual, dependendo da estratégia)
+
+
+URL: %CurrentItem.blobUrl%
+
+
+Aguarde até que o navegador faça download automático (10 s).
+
+
+Ação: “Wait for file”
+
+
+Caminho: %USERPROFILE%\Downloads\%CurrentItem.filename%
+
+
+Timeout: 30 s
+
+
+Ação: “Click Element on Web Page”
+
+
+Seletor: botão “Anexar arquivo” (no formulário ADVBox).
+
+
+Ação: “Populate Text Field on Web Page”
+
+
+Seletor: <input type="file">
+
+
+Texto: %USERPROFILE%\Downloads\%CurrentItem.filename%
+
+
+Ação: “Wait” → 5 s (para concluir upload).
+
+
+Ação: “Delete File”
+
+
+Caminho: %USERPROFILE%\Downloads\%CurrentItem.filename% (opcional, para não poluir a pasta).
+
+
+EndIf.
+
+
+Salvar Tarefa
+
+
+Ação: “Click Element on Web Page”
+
+
+Seletor: botão “Salvar” (ou “Criar”).
+
+
+Ação: “Wait” → 5–10 segundos até aparecer mensagem de confirmação.
+
+
+Ação: “Get Details of Element on Web Page”
+
+
+Seletor: elemento de texto que contém “Tarefa #1234 criada com sucesso.”
+
+
+Salve em %textoConfirmacao%.
+
+
+Ação: “Extract Text from Text”
+
+
+Modo: Regex
+
+
+Expressão regular: #(\d+)
+
+
+Texto de entrada: %textoConfirmacao%
+
+
+Salvar em %idAdvBox%.
+
+
+Fechar Navegador
+
+
+Ação: “Close Window” (ou “Terminate Process” → chrome.exe).
+
+
+Retornar Resultado
+
+
+Ação: “Return Value(s) to calling flow”
+
+
+Parâmetro de saída:
+
+ { "idAdvBox": "%idAdvBox%" }
+
+
+Extrair Logs/Tratamento de Erros (opcional)
+
+
+Envolva etapas críticas em “Try / Catch” no PAD:
+
+
+Se falha ao clicar ou importar elemento, capture screenshot (%CurrentTimestamp%.png) e envie e-mail local (caso Outlook esteja configurado) para TI.
+
+
+Se falha ao baixar anexo, registre em arquivo de log local (ErroAnexo_%CurrentTimestamp%.txt) com detalhes e continue sem anexos.
+
+
+Publicar
+
+
+Clique em Publicar no PAD. Nomeie o fluxo como RPA_CriarTarefa_ADVBox.
+
+
+
+5. Pormenores de Configuração do LLM (Azure OpenAI)
+Criar Recurso Azure OpenAI
+
+
+No portal, “Criar recurso” → “Azure OpenAI”.
+
+
+Nome: eluminai-openai.
+
+
+Regionalização conforme necessidade.
+
+
+Provisione com modelo GPT-3.5-turbo (ou GPT-4 se disponível).
+
+
+Deployment
+
+
+Após criado, vá em Deployments e crie um deployment para gpt-35-turbo (alias do modelo).
+
+
+Anote o endpoint e crie uma chave (Key1)
+
+
+Copie o endpoint (ex.: https://eluminai-openai.openai.azure.com/) e a sua chave para o Key Vault (como OPENAI_API_KEY).
+
+
+Configurações Sugeridas do Modelo
+
+
+Temperature: 0.0 (respostas determinísticas).
+
+
+Max Tokens: 600.
+
+
+System Prompt (de exemplo, dentro da Function):
+
+ Você é um assistente que extrai dados contratuais de e-mails e gera um resumo em português.
+
+
+User Prompt: conforme método montar_prompt().
+
+
+Testes de Prompt
+
+
+Use o “Test in Portal” do Azure OpenAI para validar que, dados e-mails de exemplo, o modelo retorna exatamente um JSON válido com as chaves exigidas.
+
+
+Caso quebre a formatação, torne o “User Prompt” mais restritivo, pedindo “retorne apenas JSON, sem texto adicional”.
+
+
+
+6. Configuração de Storage Account (Anexos)
+Criar Storage Account
+
+
+Nome: eluminaiattachments.
+
+
+Plano Standard LRS.
+
+
+Crie um container público/privado chamado tempanexos.
+
+
+Gerar SAS Programaticamente (opcional)
+
+
+Se preferir que a Azure Function gere a URL SAS, instale no ambiente da Function:
+
+ pip install azure-storage-blob
+
+
+Dentro da Function, use algo como:
+
+ from azure.storage.blob import generate_blob_sas, BlobSasPermissions
+import datetime
+
+def gerar_sas_url(blob_name: str) -> str:
+    from azure.storage.blob import BlobServiceClient
+    connection_str = secret_client.get_secret("BLOB_CONNECTION_STRING").value
+    blob_service = BlobServiceClient.from_connection_string(connection_str)
+    sas_token = generate_blob_sas(
+        account_name=blob_service.account_name,
+        container_name=STORAGE_ACCOUNT_CONTAINER,
+        blob_name=blob_name,
+        account_key=blob_service.credential.account_key,
+        permission=BlobSasPermissions(read=True),
+        expiry=datetime.datetime.utcnow() + datetime.timedelta(hours=2)
+    )
+    url = f"https://{blob_service.account_name}.blob.core.windows.net/{STORAGE_ACCOUNT_CONTAINER}/{blob_name}?{sas_token}"
+    return url
+
+
+Assim, em vez de subir os anexos pelo Power Automate, você pode aceitar base64 e converter em blobs dentro da Function. Mas, para simplificar, normalmente o Power Automate Cloud já faz upload direto ao Blob e gera SAS.
+
+
+Gerenciar Ciclo de Vida
+
+
+No container tempanexos, crie regra de Expiração para apagar blobs com mais de 2 horas, evitando acumular arquivos.
+
+
+
+7. Monitoramento e Tratamento de Erros
+Azure Functions
+
+
+Ative Application Insights (dentro do Function App → “Platform Features” → “Application Insights”) para capturar logs e métricas.
+
+
+Use logging.info(), logging.error() no código para registrar pontos críticos (recebimento de payload, chamada ao OpenAI, parsing do JSON, erros).
+
+
+Configure alertas no Azure para notificar o time de TI se o número de falhas ultrapassar um limiar (ex.: 5 falhas/dia).
+
+
+Power Automate Cloud
+
+
+Cada execução gera um Run History. Acesse para ver erros em cada ação.
+
+
+Configure alertas de falha (dentro do ambiente Power Automate, vá em “Alerts” e crie notificação por e-mail ou Teams se o fluxo falhar).
+
+
+Power Automate Desktop
+
+
+Habilite logs detalhados (no PAD → “Settings” → “Diagnostics” → marque “Enable Logging”).
+
+
+Caso o RPA encontre um erro crítico (por exemplo, não encontra o botão “Salvar” no ADVBox), capture screenshot e envie e-mail local (caso Outlook esteja configurado no Windows) para a equipe de TI.
+
+
+Ciclo de Vida de Blobs
+
+
+Regra de expiração automática (2 horas) para o container tempanexos.
+
+
+
+8. Custo Aproximado (R1/Base)
+Azure OpenAI:
+
+
+GPT-3.5-turbo: ~US$ 0,002 por 1k tokens.
+
+
+30 execuções/dia × 600 tokens = 18.000 tokens/dia → US$ 0,036/dia → US$ ~1/mês.
+
+
+Azure Functions (Consumption):
+
+
+900 execuções/mês (30 × 30 dias) → dentro do nível gratuito (1 milhão execuções grátis).
+
+
+Storage Account:
+
+
+Armazenar blobs temporários, 10 MB × 30/dia × 2 horas → custo desprezível (<US$ 1/mês).
+
+
+Power Automate Cloud:
+
+
+Licença “per user” ou “per flow” (dependendo do contrato corporativo): normalmente R$ 80–150/mês.
+
+
+Power Automate Desktop (RPA):
+
+
+Licença RPA no Windows: R$ 200/ano (≈R$ 17/mês).
+
+
+Browser-Use (RPA em nuvem):
+
+
+Estimado R$ 1–2 por tarefa.
+
+
+30 tarefas/dia → R$ 30–60/dia → R$ 900–1.800/mês.
+
+
+Se preferir Power Automate Desktop local (sem serviço “Browser-Use” em nuvem), não haverá esse custo por tarefa, mas exige manter a VM Windows sempre disponível (custo de máquina + manutenção).
+
+
+Em cenário híbrido (parte roda local, parte no Azure):
+É possível reduzir o custo de “Browser-Use” executando RPA puramente on-premises (ou seja, Power Automate Desktop em VM Windows, sem Microsoft Browser-Use). Nesse caso, o custo de RPA vira apenas a licença do PAD e o custo da própria VM.
+
+
+
+9. Check-List de Entrega
+Azure
+
+
+Resource Group criado.
+
+
+Storage Account (eluminaiattachments) e container tempanexos.
+
+
+Key Vault (eluminai-kv) com segredos: OPENAI_API_KEY, ADVBOX_USER, ADVBOX_PASS, ADVBOX_API_TOKEN, BLOB_CONNECTION_STRING.
+
+
+Azure Function App configurado (Managed Identity habilitada).
+
+
+Função ValidaCliente publicada e testada.
+
+
+Função ProcessaEmail publicada e testada.
+
+
+Azure OpenAI criado e deployment configurado (gpt-35-turbo).
+
+
+Power Automate Cloud
+
+
+Criado fluxo “Fluxo_CriarTarefa_ADVBox” com todas as etapas (gatilho, condições, chamadas HTTP, RPA, e-mail).
+
+
+Conector Outlook 365 configurado para ler caixa compartilhada.
+
+
+Conector HTTP validado (chama funções e recebe JSON).
+
+
+Conector “Run a flow built with Power Automate Desktop” validado.
+
+
+Power Automate Desktop
+
+
+Criado fluxo RPA_CriarTarefa_ADVBox com as variáveis de entrada.
+
+
+Inseridos passos de login no ADVBox e criação da tarefa.
+
+
+Validado que, após “Salvar”, o número da tarefa é extraído corretamente (idAdvBox).
+
+
+Fluxo publicado e disponível para execução pelo Cloud.
+
+
+Teste Ponta a Ponta
+
+
+Enviar ao menos 3 e-mails de teste cobrindo:
+
+
+Cliente ativo, sem anexos.
+
+
+Cliente ativo, com anexos.
+
+
+Cliente inativo ou inexistente.
+
+
+Verificar no Logs do Power Automate Cloud e Azure Functions se não há erros.
+
+
+Verificar no ADVBox se as tarefas foram criadas (caso cliente ativo).
+
+
+Verificar se e-mail de confirmação chegou ao cliente e advogados (com id da tarefa e resumo).
+
+
+Monitoramento e Alertas
+
+
+Application Insights configurado no Function App (alerta de falhas).
+
+
+Power Automate Cloud Alerts configurados para notificar time de TI em caso de falha.
+
+
+Ciclo de vida de blobs em tempanexos configurado (2 horas).
+
+
+
+10. Conclusão
+Com esta solução:
+Todos os e-mails de solicitações contratuais que chegarem a suporte@seudominio.com serão analisados automaticamente.
+
+
+Clientes não autorizados (inativos/inexistentes) receberão resposta imediata de “cliente não cadastrado” ou “inativo”.
+
+
+E-mails válidos serão enviados ao LLM (Azure OpenAI) para extração de dados e resumo.
+
+
+A tarefa será criada no ADVBox via RPA (Power Automate Desktop), mesmo sem API POST, justamente simulando a navegação.
+
+
+O cliente e o advogado responsável receberão um e-mail de confirmação com número do ticket ADVBox e resumo da solicitação.
+
+
+Essa arquitetura utiliza Power Automate Cloud como orquestrador, Azure Functions + Azure OpenAI para inteligência (classificação/extração/resumo) e Power Automate Desktop (RPA) para realizar a ação criadora de tarefas no ADVBox pela interface web. Cada camada é escalável e monitorada, e você tem um custo de operação bastante enxuto, especialmente se usar o RPA on-premises no lugar do serviço pago “Browser-Use”.
+Se precisar de algum ajuste mais fino em seletores do ADVBox, modelos de prompt do LLM ou configurações de Power Automate, estou à disposição para ajudar.
+
