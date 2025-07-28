@@ -1385,3 +1385,39 @@ O cliente e o advogado responsável receberão um e-mail de confirmação com n�
 Essa arquitetura utiliza Power Automate Cloud como orquestrador, Azure Functions + Azure OpenAI para inteligência (classificação/extração/resumo) e Power Automate Desktop (RPA) para realizar a ação criadora de tarefas no ADVBox pela interface web. Cada camada é escalável e monitorada, e você tem um custo de operação bastante enxuto, especialmente se usar o RPA on-premises no lugar do serviço pago “Browser-Use”.
 Se precisar de algum ajuste mais fino em seletores do ADVBox, modelos de prompt do LLM ou configurações de Power Automate, estou à disposição para ajudar.
 
+✅ Complementar o Projeto com o Fluxo “Astrea → E-mail → ADVBox”
+🎯 Objetivo dessa etapa
+Automatizar a leitura dos e-mails enviados automaticamente pelo sistema Astrea (push de andamentos processuais) e inserir essas informações no ADVBox, de forma similar à criação de tarefas — porém com foco em atualização de processo.
+
+🧠 Lógica do Fluxo Adicional
+📥 Origem:
+Sistema Astrea envia e-mails com informações de andamento processual (ex: juntada de procuração).
+🧾 Conteúdo:
+E-mail possui resumo do evento (juntada, despacho, audiência)
+Vinculado a um número de processo
+🧠 Automação:
+A IA (Azure OpenAI ou LLM local) interpreta o conteúdo
+Extrai: número do processo, tipo de evento, data, texto principal
+Power Automate verifica se o processo existe no ADVBox
+Atualiza o processo no ADVBox com o novo andamento (via RPA local)
+
+⏱️ Horas adicionais estimadas para implementar esse fluxo extra
+Etapa
+Horas Estimadas
+📩 Ajustar captura de e-mails do Astrea (filtro específico)
+1h
+🧠 Treinar e validar prompt do LLM para extração de dados processuais
+2h
+🔁 Adicionar lógica de verificação do processo no ADVBox (via RPA)
+2h
+📤 Automatizar atualização de processo no ADVBox via PAD
+3h
+🧪 Testes com diferentes tipos de andamentos / variações de formato
+2h
+📄 Logging, confirmação e fallback (ex: processo não encontrado)
+1h
+Total adicional estimado
+11h
+
+
+
